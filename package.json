@@ -1,0 +1,52 @@
+{
+  "name": "@sockeon/client",
+  "version": "1.0.0",
+  "description": "Official JavaScript/TypeScript client for Sockeon WebSocket framework",
+  "type": "module",
+  "main": "./dist/sockeon-client.cjs",
+  "module": "./dist/sockeon-client.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/sockeon-client.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/sockeon-client.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "vite build && tsc --emitDeclarationOnly --declaration",
+    "dev": "vite build --watch",
+    "type-check": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "websocket",
+    "sockeon",
+    "real-time",
+    "client",
+    "browser",
+    "typescript"
+  ],
+  "author": "Sockeon",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.0.5",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sockeon/sockeon"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
