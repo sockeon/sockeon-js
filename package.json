@@ -1,6 +1,6 @@
 {
   "name": "@sockeon/client",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Official JavaScript/TypeScript client for Sockeon WebSocket framework",
   "type": "module",
   "main": "./dist/sockeon-client.cjs",
