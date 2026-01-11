@@ -47,6 +47,9 @@
     "type": "git",
     "url": "https://github.com/sockeon/sockeon"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   }
