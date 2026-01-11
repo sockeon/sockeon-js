@@ -36,6 +36,12 @@ const socket = new Sockeon({
 // Listen to connection events
 socket.on('connect', () => {
   console.log('Connected to Sockeon server');
+  
+  // Emit events after connected (required)
+  socket.emit('chat.send', {
+    message: 'Hello, Sockeon!',
+    timestamp: Date.now(),
+  });
 });
 
 socket.on('disconnect', (data) => {
@@ -45,12 +51,6 @@ socket.on('disconnect', (data) => {
 // Listen to custom events
 socket.on('chat.message', (data) => {
   console.log('New message:', data);
-});
-
-// Emit events to server
-socket.emit('chat.send', {
-  message: 'Hello, Sockeon!',
-  timestamp: Date.now(),
 });
 
 // Connect
@@ -173,12 +173,14 @@ socket.off('user.joined');
 ```
 
 #### `emit(event: string, data: object | array): void`
-Send event to server. Event names must match `/^[a-zA-Z0-9._-]+$/`.
+Send event to server. Event names must match `/^[a-zA-Z0-9._-]+$/`. **Must be called after connection is established.**
 
 ```typescript
-socket.emit('chat.message', {
-  room: 'general',
-  text: 'Hello!',
+socket.on('connect', () => {
+  socket.emit('chat.message', {
+    room: 'general',
+    text: 'Hello!',
+  });
 });
 ```
 
@@ -307,6 +309,14 @@ try {
 } catch (error) {
   console.error('Failed to emit:', error.message);
   // Error: Invalid event name: only alphanumeric characters, dots, underscores, and hyphens are allowed
+}
+
+// Emitting before connected throws error
+try {
+  socket.emit('some.event', { data: 'test' });
+} catch (error) {
+  console.error(error.message);
+  // Error: Cannot emit: WebSocket is not connected
 }
 ```
 
