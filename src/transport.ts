@@ -4,11 +4,11 @@
  * Handles low-level WebSocket communication:
  * - Connection management
  * - Authentication via ?key= query parameter
- * - Standard WebSocket ping/pong frames
- * - Message encoding/decoding (JSON)
+ * - Message encoding/decoding (JSON text or binary frames)
  * - Protocol validation
  */
 
+import { decodeMessage, encodeMessage } from "./message";
 import type { AuthConfig, SockeonMessage } from "./types";
 
 /**
@@ -19,7 +19,6 @@ export interface TransportEventHandlers {
 	onMessage?: (message: SockeonMessage) => void;
 	onClose?: (code: number, reason: string) => void;
 	onError?: (error: Error) => void;
-	onPong?: () => void;
 }
 
 /**
@@ -40,9 +39,6 @@ export class WebSocketTransport {
 	private ws: WebSocket | null = null;
 	private handlers: TransportEventHandlers = {};
 	private options: TransportOptions;
-	private pingInterval: number | null = null;
-	private pongTimeout: number | null = null;
-	private lastPongTime: number = 0;
 	private debug: boolean = false;
 
 	constructor(options: TransportOptions) {
@@ -56,12 +52,10 @@ export class WebSocketTransport {
 	private buildUrl(): string {
 		const url = new URL(this.options.url);
 
-		// Add auth token if provided (server expects ?key=)
 		if (this.options.auth?.token) {
 			url.searchParams.set("key", this.options.auth.token);
 		}
 
-		// Add additional query parameters
 		if (this.options.query) {
 			Object.entries(this.options.query).forEach(([key, value]) => {
 				url.searchParams.set(key, value);
@@ -85,6 +79,8 @@ export class WebSocketTransport {
 
 		try {
 			this.ws = new WebSocket(url, this.options.protocols);
+			// Binary frames carry the same JSON blob as text frames.
+			this.ws.binaryType = "arraybuffer";
 			this.setupEventHandlers();
 		} catch (error) {
 			this.log("Connection error:", error);
@@ -100,7 +96,6 @@ export class WebSocketTransport {
 
 		this.ws.onopen = () => {
 			this.log("WebSocket connected");
-			this.lastPongTime = Date.now();
 			this.handlers.onOpen?.();
 		};
 
@@ -110,70 +105,50 @@ export class WebSocketTransport {
 
 		this.ws.onclose = (event: CloseEvent) => {
 			this.log("WebSocket closed:", event.code, event.reason);
-			this.stopHeartbeat();
 			this.handlers.onClose?.(event.code, event.reason);
 		};
 
-		this.ws.onerror = (event: Event) => {
-			this.log("WebSocket error:", event);
-			const error = new Error("WebSocket error occurred");
-			this.handlers.onError?.(error);
+		this.ws.onerror = () => {
+			this.log("WebSocket error");
+			this.handlers.onError?.(new Error("WebSocket error occurred"));
 		};
 	}
 
 	/**
-	 * Handle incoming message
+	 * Handle incoming message (text or binary JSON)
 	 */
 	private handleMessage(data: string | ArrayBuffer | Blob): void {
-		// Handle binary data (ping/pong frames)
-		if (data instanceof ArrayBuffer || data instanceof Blob) {
-			this.log("Received binary frame (likely pong)");
-			this.lastPongTime = Date.now();
-			this.handlers.onPong?.();
+		let text: string;
+
+		if (typeof data === "string") {
+			text = data;
+		} else if (data instanceof ArrayBuffer) {
+			text = new TextDecoder().decode(data);
+		} else if (typeof Blob !== "undefined" && data instanceof Blob) {
+			// binaryType is arraybuffer; Blob path kept for unusual hosts.
+			void data.text().then(
+				(t) => this.parseAndDispatch(t),
+				() => this.handlers.onError?.(new Error("Failed to read binary frame")),
+			);
+			return;
+		} else {
 			return;
 		}
 
-		// Parse JSON message
+		this.parseAndDispatch(text);
+	}
+
+	private parseAndDispatch(text: string): void {
 		try {
-			const message = JSON.parse(data);
-
-			// Validate message structure
-			if (!this.isValidMessage(message)) {
-				this.log("Invalid message structure:", message);
-				this.handlers.onError?.(new Error("Invalid message format"));
-				return;
-			}
-
+			const message = decodeMessage(text);
 			this.log("Received message:", message.event, message.data);
 			this.handlers.onMessage?.(message);
 		} catch (error) {
 			this.log("Failed to parse message:", error);
-			this.handlers.onError?.(new Error("Failed to parse message"));
+			this.handlers.onError?.(
+				error instanceof Error ? error : new Error("Failed to parse message"),
+			);
 		}
-	}
-
-	/**
-	 * Validate message structure matches Sockeon protocol
-	 * Server expects: { "event": "string", "data": {} }
-	 */
-	private isValidMessage(message: unknown): message is SockeonMessage {
-		if (!message || typeof message !== "object") {
-			return false;
-		}
-
-		const msg = message as Record<string, unknown>;
-
-		// Event must be a non-empty string
-		if (typeof msg.event !== "string" || msg.event.length === 0) {
-			return false;
-		}
-
-		// Data must exist (can be empty object/array)
-		if (!("data" in msg)) {
-			return false;
-		}
-
-		return true;
 	}
 
 	/**
@@ -185,66 +160,12 @@ export class WebSocketTransport {
 		}
 
 		try {
-			const json = JSON.stringify(message);
+			const json = encodeMessage(message);
 			this.log("Sending message:", message.event, message.data);
 			this.ws.send(json);
-		} catch (error) {
-			this.log("Failed to send message:", error);
+		} catch {
+			this.log("Failed to send message");
 			throw new Error("Failed to send message");
-		}
-	}
-
-	/**
-	 * Send ping frame to server
-	 * Note: Browser WebSocket API doesn't expose ping control directly,
-	 * but the browser automatically handles ping/pong frames.
-	 * This is a placeholder for manual heartbeat if needed.
-	 */
-	sendPing(): void {
-		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			return;
-		}
-
-		// Browser WebSocket automatically handles ping/pong
-		// We just update the timestamp to track connectivity
-		this.log("Heartbeat check");
-	}
-
-	/**
-	 * Start heartbeat (periodic ping)
-	 */
-	startHeartbeat(interval: number, timeout: number): void {
-		this.stopHeartbeat();
-
-		this.pingInterval = window.setInterval(() => {
-			const timeSinceLastPong = Date.now() - this.lastPongTime;
-
-			// Check if we've received pong recently
-			if (timeSinceLastPong > timeout) {
-				this.log("Heartbeat timeout - no pong received");
-				this.disconnect(1000, "Heartbeat timeout");
-				return;
-			}
-
-			this.sendPing();
-		}, interval);
-
-		this.log("Heartbeat started:", interval, "ms");
-	}
-
-	/**
-	 * Stop heartbeat
-	 */
-	stopHeartbeat(): void {
-		if (this.pingInterval !== null) {
-			clearInterval(this.pingInterval);
-			this.pingInterval = null;
-			this.log("Heartbeat stopped");
-		}
-
-		if (this.pongTimeout !== null) {
-			clearTimeout(this.pongTimeout);
-			this.pongTimeout = null;
 		}
 	}
 
@@ -252,8 +173,6 @@ export class WebSocketTransport {
 	 * Disconnect from server
 	 */
 	disconnect(code: number = 1000, reason: string = "Normal closure"): void {
-		this.stopHeartbeat();
-
 		if (this.ws) {
 			if (
 				this.ws.readyState === WebSocket.OPEN ||
@@ -264,6 +183,28 @@ export class WebSocketTransport {
 			}
 			this.ws = null;
 		}
+	}
+
+	/**
+	 * Abort an in-flight handshake without waiting for close handshake.
+	 */
+	abort(): void {
+		if (!this.ws) return;
+		try {
+			this.ws.onopen = null;
+			this.ws.onmessage = null;
+			this.ws.onerror = null;
+			this.ws.onclose = null;
+			if (
+				this.ws.readyState === WebSocket.OPEN ||
+				this.ws.readyState === WebSocket.CONNECTING
+			) {
+				this.ws.close(1000, "Aborted");
+			}
+		} catch {
+			// ignore
+		}
+		this.ws = null;
 	}
 
 	/**

@@ -1,19 +1,13 @@
 /**
  * Sockeon Event Emitter
  *
- * Simple event emitter for handling:
- * - Event registration (on)
- * - Event emission (emit)
- * - Event removal (off)
- * - Once handlers
- * - Wildcard support (*)
+ * - on / once / off
+ * - Wildcard (*)
+ * - Subscription.cancel()
  */
 
-import type { EventHandler } from "./types";
+import type { EventHandler, Subscription } from "./types";
 
-/**
- * Internal event handler wrapper
- */
 interface HandlerWrapper {
 	handler: EventHandler;
 	once: boolean;
@@ -31,9 +25,9 @@ export class EventEmitter {
 	}
 
 	/**
-	 * Register an event handler
+	 * Register an event handler; returns cancellable subscription
 	 */
-	on(event: string, handler: EventHandler): void {
+	on(event: string, handler: EventHandler): Subscription {
 		if (typeof handler !== "function") {
 			throw new Error("Event handler must be a function");
 		}
@@ -43,12 +37,16 @@ export class EventEmitter {
 		this.events.set(event, handlers);
 
 		this.log(`Registered handler for event: ${event}`);
+
+		return {
+			cancel: () => this.off(event, handler),
+		};
 	}
 
 	/**
 	 * Register a one-time event handler
 	 */
-	once(event: string, handler: EventHandler): void {
+	once(event: string, handler: EventHandler): Subscription {
 		if (typeof handler !== "function") {
 			throw new Error("Event handler must be a function");
 		}
@@ -58,25 +56,26 @@ export class EventEmitter {
 		this.events.set(event, handlers);
 
 		this.log(`Registered once handler for event: ${event}`);
+
+		return {
+			cancel: () => this.off(event, handler),
+		};
 	}
 
 	/**
 	 * Remove event handler(s)
-	 * If no handler provided, removes all handlers for the event
 	 */
 	off(event: string, handler?: EventHandler): void {
 		if (!this.events.has(event)) {
 			return;
 		}
 
-		// Remove all handlers for this event
 		if (!handler) {
 			this.events.delete(event);
 			this.log(`Removed all handlers for event: ${event}`);
 			return;
 		}
 
-		// Remove specific handler
 		const handlers = this.events.get(event) || [];
 		const filtered = handlers.filter((wrapper) => wrapper.handler !== handler);
 
@@ -95,20 +94,15 @@ export class EventEmitter {
 	emit(event: string, data?: unknown): void {
 		this.log(`Emitting event: ${event}`, data);
 
-		// Call handlers for specific event
 		const handlers = this.events.get(event) || [];
 		this.callHandlers(event, handlers, data);
 
-		// Call wildcard handlers
 		const wildcardHandlers = this.events.get("*") || [];
 		if (wildcardHandlers.length > 0) {
-			this.callHandlers(event, wildcardHandlers, data);
+			this.callHandlers("*", wildcardHandlers, data);
 		}
 	}
 
-	/**
-	 * Call all handlers for an event
-	 */
 	private callHandlers(
 		event: string,
 		handlers: HandlerWrapper[],
@@ -116,11 +110,10 @@ export class EventEmitter {
 	): void {
 		const toRemove: EventHandler[] = [];
 
-		for (const wrapper of handlers) {
+		for (const wrapper of [...handlers]) {
 			try {
 				wrapper.handler(data);
 
-				// Mark once handlers for removal
 				if (wrapper.once) {
 					toRemove.push(wrapper.handler);
 				}
@@ -129,7 +122,6 @@ export class EventEmitter {
 			}
 		}
 
-		// Remove once handlers
 		if (toRemove.length > 0) {
 			const remaining = handlers.filter(
 				(wrapper) => !toRemove.includes(wrapper.handler),
@@ -142,38 +134,23 @@ export class EventEmitter {
 		}
 	}
 
-	/**
-	 * Remove all event handlers
-	 */
 	removeAllListeners(): void {
 		this.events.clear();
 		this.log("Removed all event handlers");
 	}
 
-	/**
-	 * Get all registered event names
-	 */
 	eventNames(): string[] {
 		return Array.from(this.events.keys());
 	}
 
-	/**
-	 * Get handler count for an event
-	 */
 	listenerCount(event: string): number {
 		return (this.events.get(event) || []).length;
 	}
 
-	/**
-	 * Check if event has any listeners
-	 */
 	hasListeners(event: string): boolean {
 		return this.listenerCount(event) > 0;
 	}
 
-	/**
-	 * Debug logging
-	 */
 	private log(...args: unknown[]): void {
 		if (this.debug) {
 			console.log("[Sockeon Events]", ...args);

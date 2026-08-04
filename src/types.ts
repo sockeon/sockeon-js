@@ -1,17 +1,15 @@
 /**
  * Sockeon WebSocket Client - Type Definitions
  *
- * Protocol specification based on Sockeon PHP framework:
- * - Message format: { event: string, data: object }
+ * Wire protocol (Sockeon server 2.x / 3.x):
+ * - Message format: { event: string, data: object|array }
  * - Event names: /^[a-zA-Z0-9._-]+$/
  * - Authentication: query parameter (?key=token)
- * - Namespaces: supported (default: '/')
- * - Rooms: supported per namespace
+ * - Rooms: join_room / leave_room → room_joined / room_left
  */
 
 /**
  * Sockeon message format - matches server protocol exactly
- * Server validates: { "event": string (regex: /^[a-zA-Z0-9._-]+$/), "data": object|array }
  */
 export interface SockeonMessage {
 	/** Event name (alphanumeric + ._- only) */
@@ -24,6 +22,13 @@ export interface SockeonMessage {
  * Event handler function signature
  */
 export type EventHandler = (data: unknown) => void;
+
+/**
+ * Cancellable listener handle returned by on/once
+ */
+export interface Subscription {
+	cancel(): void;
+}
 
 /**
  * Connection state
@@ -49,17 +54,20 @@ export interface ReconnectConfig {
 	maxDelay: number;
 	/** Delay multiplier for exponential backoff */
 	factor: number;
+	/** Re-emit join_room for tracked rooms after reconnect */
+	rejoinRooms: boolean;
 }
 
 /**
- * Ping/Pong heartbeat configuration
+ * Browser WebSocket stacks handle ping/pong themselves.
+ * This option is retained for API stability; enabling it is a no-op.
  */
 export interface HeartbeatConfig {
-	/** Enable periodic ping frames */
+	/** @deprecated No-op in browsers; keep-alive is native WS ping/pong */
 	enabled: boolean;
-	/** Ping interval in milliseconds */
+	/** @deprecated */
 	interval: number;
-	/** Pong timeout in milliseconds */
+	/** @deprecated */
 	timeout: number;
 }
 
@@ -73,13 +81,24 @@ export interface AuthConfig {
 }
 
 /**
+ * Per-call room options
+ */
+export interface RoomOptions {
+	/** Namespace for this room op (default: client namespace option) */
+	namespace?: string;
+}
+
+/**
  * Main client configuration options
  */
 export interface SockeonOptions {
 	/** WebSocket URL (ws:// or wss://) */
 	url: string;
 
-	/** Namespace to connect to (default: '/') */
+	/**
+	 * Default namespace for room operations (default: '/').
+	 * Not a connect-time path — server namespaces are joined server-side.
+	 */
 	namespace?: string;
 
 	/** Authentication configuration */
@@ -88,8 +107,16 @@ export interface SockeonOptions {
 	/** Auto-reconnect configuration */
 	reconnect?: boolean | Partial<ReconnectConfig>;
 
-	/** Heartbeat/ping configuration */
+	/**
+	 * @deprecated No-op in browsers. Keep-alive uses native WebSocket ping/pong.
+	 */
 	heartbeat?: boolean | Partial<HeartbeatConfig>;
+
+	/** Handshake timeout in ms (default: 10000) */
+	connectTimeout?: number;
+
+	/** Room join/leave ack timeout in ms (default: 10000) */
+	ackTimeout?: number;
 
 	/** Additional query parameters */
 	query?: Record<string, string>;
@@ -110,6 +137,8 @@ export interface NormalizedSockeonOptions {
 	auth?: AuthConfig;
 	reconnect: ReconnectConfig;
 	heartbeat: HeartbeatConfig;
+	connectTimeout: number;
+	ackTimeout: number;
 	query: Record<string, string>;
 	protocols?: string | string[];
 	debug: boolean;
@@ -127,19 +156,18 @@ export interface SockeonError {
 
 /**
  * System event names
- * - 'error': Server-sent error messages
- * - Client-side events: 'connect', 'disconnect', 'reconnect', etc.
  */
 export const SYSTEM_EVENTS = {
-	// Client-side lifecycle events
 	CONNECT: "connect",
 	DISCONNECT: "disconnect",
 	RECONNECT: "reconnect",
 	RECONNECT_ATTEMPT: "reconnect_attempt",
 	RECONNECT_FAILED: "reconnect_failed",
 	RECONNECT_ERROR: "reconnect_error",
-	// Server-sent events
 	ERROR: "error",
+	ROOM_JOINED: "room_joined",
+	ROOM_LEFT: "room_left",
+	RATE_LIMIT_EXCEEDED: "rate_limit_exceeded",
 } as const;
 
 /**
@@ -157,27 +185,6 @@ export const CLOSE_CODES = {
 } as const;
 
 /**
- * Default configuration values
- */
-export const DEFAULT_OPTIONS: Omit<NormalizedSockeonOptions, "url"> = {
-	namespace: "/",
-	reconnect: {
-		enabled: true,
-		maxAttempts: 5,
-		delay: 1000,
-		maxDelay: 30000,
-		factor: 1.5,
-	},
-	heartbeat: {
-		enabled: true,
-		interval: 30000,
-		timeout: 5000,
-	},
-	query: {},
-	debug: false,
-};
-
-/**
  * Room tracking
  */
 export interface RoomInfo {
@@ -185,34 +192,8 @@ export interface RoomInfo {
 	name: string;
 	/** Namespace the room belongs to */
 	namespace: string;
-	/** Timestamp when joined */
+	/** Timestamp when join was requested / acked */
 	joinedAt: number;
-}
-
-/**
- * Namespace client interface
- */
-export interface NamespaceClient {
-	/** Namespace path */
-	readonly namespace: string;
-
-	/** Emit event to server */
-	emit(event: string, data?: Record<string, unknown> | unknown[]): void;
-
-	/** Listen to event */
-	on(event: string, handler: EventHandler): void;
-
-	/** Remove event listener */
-	off(event: string, handler?: EventHandler): void;
-
-	/** Join a room */
-	joinRoom(room: string): void;
-
-	/** Leave a room */
-	leaveRoom(room: string): void;
-
-	/** Get current rooms */
-	getRooms(): string[];
 }
 
 /**
@@ -223,7 +204,7 @@ export interface ConnectionInfo {
 	state: ConnectionState;
 	/** WebSocket URL */
 	url: string;
-	/** Current namespace */
+	/** Default namespace for room ops */
 	namespace: string;
 	/** Connected timestamp (null if not connected) */
 	connectedAt: number | null;

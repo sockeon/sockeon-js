@@ -1,8 +1,7 @@
 /**
  * Sockeon WebSocket Client
  *
- * Main client class for connecting to Sockeon WebSocket server.
- * Provides event-based API matching the Sockeon protocol exactly.
+ * Event-based API matching Sockeon protocol (server 2.x / 3.x).
  *
  * @example
  * ```ts
@@ -10,19 +9,18 @@
  *
  * const socket = new Sockeon({
  *   url: 'ws://localhost:6001',
- *   namespace: '/',
  *   auth: { token: 'your-token' },
- *   reconnect: true,
  * });
  *
- * socket.on('connect', () => console.log('Connected'));
- * socket.on('chat.message', (data) => console.log('Message:', data));
- *
+ * socket.on('chat.message', (data) => console.log(data));
+ * await socket.connect();
+ * await socket.joinRoom('general');
  * socket.emit('chat.send', { body: 'Hello!' });
  * ```
  */
 
 import { EventEmitter } from "./events";
+import { isValidEventName } from "./message";
 import { WebSocketTransport } from "./transport";
 import type {
 	ConnectionInfo,
@@ -31,9 +29,21 @@ import type {
 	HeartbeatConfig,
 	NormalizedSockeonOptions,
 	ReconnectConfig,
+	RoomInfo,
+	RoomOptions,
 	SockeonMessage,
 	SockeonOptions,
+	Subscription,
 } from "./types";
+
+interface RoomKey {
+	room: string;
+	namespace: string;
+}
+
+function roomKeyId(key: RoomKey): string {
+	return `${key.namespace}\0${key.room}`;
+}
 
 /**
  * Main Sockeon WebSocket client
@@ -44,11 +54,14 @@ export class Sockeon {
 	private events: EventEmitter;
 	private state: ConnectionState = "disconnected";
 	private reconnectAttempts: number = 0;
-	private reconnectTimer: number | null = null;
-	private heartbeatTimer: number | null = null;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private connectTimer: ReturnType<typeof setTimeout> | null = null;
 	private connectedAt: number | null = null;
-	private rooms: Set<string> = new Set();
+	private rooms: Map<string, RoomInfo> = new Map();
 	private manualDisconnect: boolean = false;
+	private connectPromise: Promise<void> | null = null;
+	private connectResolve: (() => void) | null = null;
+	private connectReject: ((err: Error) => void) | null = null;
 
 	constructor(options: SockeonOptions) {
 		this.options = this.normalizeOptions(options);
@@ -64,9 +77,6 @@ export class Sockeon {
 		this.setupTransportHandlers();
 	}
 
-	/**
-	 * Normalize and merge options with defaults
-	 */
 	private normalizeOptions(options: SockeonOptions): NormalizedSockeonOptions {
 		const defaults = {
 			namespace: "/",
@@ -76,17 +86,19 @@ export class Sockeon {
 				delay: 1000,
 				maxDelay: 30000,
 				factor: 1.5,
+				rejoinRooms: true,
 			},
 			heartbeat: {
-				enabled: true,
+				enabled: false,
 				interval: 30000,
 				timeout: 5000,
 			},
+			connectTimeout: 10000,
+			ackTimeout: 10000,
 			query: {},
 			debug: false,
 		};
 
-		// Handle reconnect option
 		let reconnect: ReconnectConfig;
 		if (typeof options.reconnect === "boolean") {
 			reconnect = { ...defaults.reconnect, enabled: options.reconnect };
@@ -96,7 +108,6 @@ export class Sockeon {
 			reconnect = defaults.reconnect;
 		}
 
-		// Handle heartbeat option
 		let heartbeat: HeartbeatConfig;
 		if (typeof options.heartbeat === "boolean") {
 			heartbeat = { ...defaults.heartbeat, enabled: options.heartbeat };
@@ -112,46 +123,65 @@ export class Sockeon {
 			auth: options.auth,
 			reconnect,
 			heartbeat,
+			connectTimeout: options.connectTimeout ?? defaults.connectTimeout,
+			ackTimeout: options.ackTimeout ?? defaults.ackTimeout,
 			query: { ...defaults.query, ...options.query },
 			protocols: options.protocols,
 			debug: options.debug ?? defaults.debug,
 		};
 	}
 
-	/**
-	 * Setup transport event handlers
-	 */
 	private setupTransportHandlers(): void {
 		this.transport.on({
 			onOpen: () => this.handleConnect(),
 			onMessage: (message) => this.handleMessage(message),
 			onClose: (code, reason) => this.handleDisconnect(code, reason),
 			onError: (error) => this.handleError(error),
-			onPong: () => this.handlePong(),
 		});
 	}
 
 	/**
-	 * Connect to the WebSocket server
+	 * Connect to the WebSocket server.
+	 * Resolves when handshake succeeds; rejects on failure or connectTimeout.
 	 */
-	connect(): void {
-		if (this.state === "connected" || this.state === "connecting") {
-			this.log("Already connected or connecting");
-			return;
+	connect(): Promise<void> {
+		if (this.state === "connected") {
+			return Promise.resolve();
+		}
+
+		if (this.connectPromise) {
+			return this.connectPromise;
 		}
 
 		this.manualDisconnect = false;
-		this.state = "connecting";
-		this.transport.connect();
+
+		this.connectPromise = new Promise<void>((resolve, reject) => {
+			this.connectResolve = resolve;
+			this.connectReject = reject;
+			this.state =
+				this.reconnectAttempts > 0 ? "reconnecting" : "connecting";
+			this.transport.connect();
+
+			this.connectTimer = setTimeout(() => {
+				this.failConnect(
+					new Error(
+						`Timed out connecting to ${this.options.url} after ${this.options.connectTimeout}ms`,
+					),
+				);
+			}, this.options.connectTimeout);
+		});
+
+		return this.connectPromise;
 	}
 
 	/**
-	 * Disconnect from the WebSocket server
+	 * Disconnect from the WebSocket server (disables auto-reconnect)
 	 */
 	disconnect(): void {
 		this.manualDisconnect = true;
 		this.clearReconnectTimer();
-		this.clearHeartbeatTimer();
+		this.clearConnectTimer();
+		this.rejectConnect(new Error("Client disconnect"));
 
 		if (this.state !== "disconnected") {
 			this.state = "closing";
@@ -162,15 +192,15 @@ export class Sockeon {
 	/**
 	 * Register event handler
 	 */
-	on(event: string, handler: EventHandler): void {
-		this.events.on(event, handler);
+	on(event: string, handler: EventHandler): Subscription {
+		return this.events.on(event, handler);
 	}
 
 	/**
 	 * Register one-time event handler
 	 */
-	once(event: string, handler: EventHandler): void {
-		this.events.once(event, handler);
+	once(event: string, handler: EventHandler): Subscription {
+		return this.events.once(event, handler);
 	}
 
 	/**
@@ -182,21 +212,18 @@ export class Sockeon {
 
 	/**
 	 * Emit event to server
-	 * Validates event name and data structure per Sockeon protocol
 	 */
 	emit(event: string, data: Record<string, unknown> | unknown[] = {}): void {
 		if (this.state !== "connected") {
 			throw new Error("Cannot emit: WebSocket is not connected");
 		}
 
-		// Validate event name format (alphanumeric + ._- only)
-		if (!/^[a-zA-Z0-9._-]+$/.test(event)) {
+		if (!isValidEventName(event)) {
 			throw new Error(
 				"Invalid event name: only alphanumeric characters, dots, underscores, and hyphens are allowed",
 			);
 		}
 
-		// Ensure data is object or array
 		if (typeof data !== "object" || data === null) {
 			throw new Error("Data must be an object or array");
 		}
@@ -206,41 +233,108 @@ export class Sockeon {
 	}
 
 	/**
-	 * Join a room in the current namespace
+	 * Join a room; resolves on `room_joined` ack (or ackTimeout).
 	 */
-	joinRoom(room: string): void {
-		if (this.state !== "connected") {
-			throw new Error("Cannot join room: not connected");
-		}
+	joinRoom(room: string, options?: RoomOptions): Promise<void> {
+		const namespace = options?.namespace ?? this.options.namespace;
+		const key: RoomKey = { room, namespace };
+		this.rooms.set(roomKeyId(key), {
+			name: room,
+			namespace,
+			joinedAt: Date.now(),
+		});
 
-		this.rooms.add(room);
-		this.emit("join_room", { room, namespace: this.options.namespace });
-		this.log(`Joined room: ${room}`);
+		return this.roomRequest({
+			emitEvent: "join_room",
+			ackEvent: "room_joined",
+			room,
+			namespace,
+		});
 	}
 
 	/**
-	 * Leave a room in the current namespace
+	 * Leave a room; resolves on `room_left` ack (or ackTimeout).
 	 */
-	leaveRoom(room: string): void {
-		if (this.state !== "connected") {
-			throw new Error("Cannot leave room: not connected");
-		}
+	leaveRoom(room: string, options?: RoomOptions): Promise<void> {
+		const namespace = options?.namespace ?? this.options.namespace;
+		this.rooms.delete(roomKeyId({ room, namespace }));
 
-		this.rooms.delete(room);
-		this.emit("leave_room", { room, namespace: this.options.namespace });
-		this.log(`Left room: ${room}`);
+		return this.roomRequest({
+			emitEvent: "leave_room",
+			ackEvent: "room_left",
+			room,
+			namespace,
+		});
+	}
+
+	private roomRequest(args: {
+		emitEvent: string;
+		ackEvent: string;
+		room: string;
+		namespace: string;
+	}): Promise<void> {
+		const { emitEvent, ackEvent, room, namespace } = args;
+
+		return new Promise<void>((resolve, reject) => {
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | null = null;
+			let sub: Subscription | null = null;
+
+			const finish = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				if (timer !== null) clearTimeout(timer);
+				sub?.cancel();
+				if (error) reject(error);
+				else resolve();
+			};
+
+			sub = this.on(ackEvent, (data) => {
+				const payload = data as Record<string, unknown>;
+				if (payload.room === room) {
+					// Namespace match when server sends it
+					if (
+						payload.namespace !== undefined &&
+						payload.namespace !== namespace
+					) {
+						return;
+					}
+					finish();
+				}
+			});
+
+			timer = setTimeout(() => {
+				finish(
+					new Error(
+						`Timed out waiting for "${ackEvent}" acknowledgement for room "${room}"`,
+					),
+				);
+			}, this.options.ackTimeout);
+
+			try {
+				this.emit(emitEvent, { room, namespace });
+			} catch (error) {
+				finish(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
 	}
 
 	/**
-	 * Get current rooms
+	 * Room names currently tracked (for rejoin)
 	 */
 	getRooms(): string[] {
-		return Array.from(this.rooms);
+		return Array.from(
+			new Set(Array.from(this.rooms.values()).map((r) => r.name)),
+		);
 	}
 
 	/**
-	 * Get connection info
+	 * Full room info currently tracked
 	 */
+	getJoinedRooms(): RoomInfo[] {
+		return Array.from(this.rooms.values());
+	}
+
 	getConnectionInfo(): ConnectionInfo {
 		return {
 			state: this.state,
@@ -252,32 +346,26 @@ export class Sockeon {
 		};
 	}
 
-	/**
-	 * Get current connection state
-	 */
 	getState(): ConnectionState {
 		return this.state;
 	}
 
-	/**
-	 * Check if connected
-	 */
 	isConnected(): boolean {
 		return this.state === "connected";
 	}
 
-	/**
-	 * Handle successful connection
-	 */
 	private handleConnect(): void {
+		this.clearConnectTimer();
 		this.state = "connected";
 		this.connectedAt = Date.now();
 		this.reconnectAttempts = 0;
 		this.clearReconnectTimer();
 
-		// Start heartbeat if enabled
 		if (this.options.heartbeat.enabled) {
-			this.startHeartbeat();
+			// ponytail: browser WS cannot send ping frames; native stack handles keep-alive
+			this.log(
+				"heartbeat option enabled but is a no-op in browsers (native ping/pong)",
+			);
 		}
 
 		this.log("Connected to Sockeon server");
@@ -285,66 +373,115 @@ export class Sockeon {
 			namespace: this.options.namespace,
 			timestamp: this.connectedAt,
 		});
+
+		this.rejoinRoomsIfNeeded();
+		this.resolveConnect();
 	}
 
-	/**
-	 * Handle incoming message from server
-	 */
+	private rejoinRoomsIfNeeded(): void {
+		if (!this.options.reconnect.rejoinRooms || this.rooms.size === 0) {
+			return;
+		}
+
+		for (const info of this.rooms.values()) {
+			try {
+				this.emit("join_room", {
+					room: info.name,
+					namespace: info.namespace,
+				});
+			} catch (error) {
+				this.log("Failed to rejoin room:", info.name, error);
+			}
+		}
+	}
+
 	private handleMessage(message: SockeonMessage): void {
 		const { event, data } = message;
-
 		this.log(`Received event: ${event}`, data);
 		this.events.emit(event, data);
 	}
 
-	/**
-	 * Handle disconnection
-	 */
 	private handleDisconnect(code: number, reason: string): void {
-		this.clearHeartbeatTimer();
+		this.clearConnectTimer();
 		const wasConnected = this.state === "connected";
+		const wasConnecting =
+			this.state === "connecting" || this.state === "reconnecting";
 
 		this.state = "disconnected";
 		this.connectedAt = null;
-		this.rooms.clear();
+		// Keep rooms for rejoin; do not clear.
 
 		this.log(`Disconnected (code: ${code}, reason: ${reason})`);
+
+		if (wasConnecting && this.connectReject) {
+			this.failConnect(
+				new Error(`Connection closed during handshake (${code}: ${reason})`),
+			);
+			return;
+		}
 
 		if (wasConnected) {
 			this.events.emit("disconnect", { code, reason });
 		}
 
-		// Attempt reconnection if not manual disconnect
 		if (!this.manualDisconnect && this.options.reconnect.enabled) {
 			this.scheduleReconnect();
 		}
 	}
 
-	/**
-	 * Handle transport error
-	 */
 	private handleError(error: Error): void {
 		this.log("Transport error:", error);
+
+		if (this.connectReject) {
+			// Handshake error; failConnect aborts socket → onclose may follow.
+			this.failConnect(error);
+			return;
+		}
+
 		this.events.emit("error", {
 			message: error.message,
 			timestamp: Date.now(),
 		});
 	}
 
-	/**
-	 * Handle pong response
-	 */
-	private handlePong(): void {
-		this.log("Pong received");
+	private resolveConnect(): void {
+		const resolve = this.connectResolve;
+		this.connectPromise = null;
+		this.connectResolve = null;
+		this.connectReject = null;
+		resolve?.();
 	}
 
-	/**
-	 * Schedule reconnection attempt
-	 */
+	private rejectConnect(error: Error): void {
+		const reject = this.connectReject;
+		this.connectPromise = null;
+		this.connectResolve = null;
+		this.connectReject = null;
+		reject?.(error);
+	}
+
+	private failConnect(error: Error): void {
+		this.clearConnectTimer();
+		this.transport.abort();
+		this.state = "disconnected";
+
+		const wasInitial = this.reconnectAttempts === 0;
+		this.rejectConnect(error);
+
+		// Initial connect failure: leave disconnected (caller may retry).
+		// Auto-reconnect failure: keep attempting until maxAttempts.
+		if (
+			!wasInitial &&
+			!this.manualDisconnect &&
+			this.options.reconnect.enabled
+		) {
+			this.scheduleReconnect();
+		}
+	}
+
 	private scheduleReconnect(): void {
 		const { maxAttempts, delay, maxDelay, factor } = this.options.reconnect;
 
-		// Check if max attempts reached
 		if (maxAttempts > 0 && this.reconnectAttempts >= maxAttempts) {
 			this.log("Max reconnection attempts reached");
 			this.events.emit("reconnect_failed", {
@@ -354,7 +491,6 @@ export class Sockeon {
 			return;
 		}
 
-		// Calculate delay with exponential backoff
 		const currentDelay = Math.min(
 			delay * factor ** this.reconnectAttempts,
 			maxDelay,
@@ -371,15 +507,15 @@ export class Sockeon {
 			delay: currentDelay,
 		});
 
-		this.reconnectTimer = window.setTimeout(() => {
+		this.reconnectTimer = setTimeout(() => {
 			this.log(`Reconnection attempt ${this.reconnectAttempts}`);
-			this.transport.connect();
+			this.manualDisconnect = false;
+			void this.connect().catch(() => {
+				// connect failure already routed; scheduleReconnect via disconnect if needed
+			});
 		}, currentDelay);
 	}
 
-	/**
-	 * Clear reconnect timer
-	 */
 	private clearReconnectTimer(): void {
 		if (this.reconnectTimer !== null) {
 			clearTimeout(this.reconnectTimer);
@@ -387,35 +523,13 @@ export class Sockeon {
 		}
 	}
 
-	/**
-	 * Start heartbeat mechanism
-	 */
-	private startHeartbeat(): void {
-		this.clearHeartbeatTimer();
-
-		const { interval } = this.options.heartbeat;
-		this.heartbeatTimer = window.setInterval(() => {
-			if (this.state === "connected") {
-				this.transport.sendPing();
-			}
-		}, interval);
-
-		this.log(`Heartbeat started (interval: ${interval}ms)`);
-	}
-
-	/**
-	 * Clear heartbeat timer
-	 */
-	private clearHeartbeatTimer(): void {
-		if (this.heartbeatTimer !== null) {
-			clearInterval(this.heartbeatTimer);
-			this.heartbeatTimer = null;
+	private clearConnectTimer(): void {
+		if (this.connectTimer !== null) {
+			clearTimeout(this.connectTimer);
+			this.connectTimer = null;
 		}
 	}
 
-	/**
-	 * Debug logging
-	 */
 	private log(...args: unknown[]): void {
 		if (this.options.debug) {
 			console.log("[Sockeon Client]", ...args);
@@ -423,7 +537,6 @@ export class Sockeon {
 	}
 }
 
-// Export types and constants
 export type {
 	AuthConfig,
 	ConnectionInfo,
@@ -432,8 +545,11 @@ export type {
 	HeartbeatConfig,
 	ReconnectConfig,
 	RoomInfo,
+	RoomOptions,
 	SockeonMessage,
 	SockeonOptions,
+	Subscription,
 } from "./types";
 
 export { CLOSE_CODES, SYSTEM_EVENTS } from "./types";
+export { decodeMessage, encodeMessage, isValidEventName } from "./message";
